@@ -111,8 +111,22 @@
               <label for="density">字符密度</label>
               <output id="densityOut" for="density">100 列</output>
             </div>
-            <input id="density" class="range" type="range" min="40" max="220" step="2" value="100">
-            <p class="hint">列数越多，保留的细节越丰富</p>
+            <input id="density" class="range" type="range" min="40" max="320" step="2" value="100">
+            <p class="hint">最高 320 列，细节更丰富；高密度会降低实时帧率</p>
+            <div class="resolution-row">
+              <span class="resolution-copy">
+                <span>截图分辨率</span>
+                <small>PNG 长边像素</small>
+              </span>
+              <span class="select-wrap resolution-select">
+                <select id="outputRes" aria-label="PNG 截图分辨率">
+                  <option value="1920">1080P</option>
+                  <option value="2560">2K</option>
+                  <option value="3840">4K</option>
+                </select>
+                <svg class="icon select-chevron"><use href="#i-chevron"></use></svg>
+              </span>
+            </div>
           </section>
 
           <section class="control-group">
@@ -444,6 +458,7 @@
               <option value="720">720p</option>
               <option value="1080" selected>1080p</option>
               <option value="1440">1440p</option>
+              <option value="2160">2160p · 4K</option>
             </select>
             <svg class="icon select-chevron"><use href="#i-chevron"></use></svg>
           </span>

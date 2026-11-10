@@ -124,6 +124,7 @@
     invert: false,
     font: "mono",
     scanline: true,
+    outputRes: 2560,
   });
 
   const PRESETS = {
@@ -298,6 +299,7 @@
     font: null,
     invert: null,
     scanline: null,
+    outputRes: null,
     dialog: null,
     dialogTitle: null,
     dialogKicker: null,
@@ -378,6 +380,7 @@
     el.font = $("#font");
     el.invert = $("#invert");
     el.scanline = $("#scanline");
+    el.outputRes = $("#outputRes");
     el.dialog = $("#exportDialog");
     el.dialogTitle = $("#dialogTitle");
     el.dialogKicker = $("#dialogKicker");
@@ -444,6 +447,7 @@
     if (typeof raw.invert === "boolean") next.invert = raw.invert;
     if (Object.prototype.hasOwnProperty.call(FONTS, raw.font)) next.font = raw.font;
     if (typeof raw.scanline === "boolean") next.scanline = raw.scanline;
+    if ([1920, 2560, 3840].includes(Number(raw.outputRes))) next.outputRes = Number(raw.outputRes);
     return next;
   }
 
@@ -610,6 +614,7 @@
     el.font.value = s.font;
     el.invert.checked = s.invert;
     el.scanline.checked = s.scanline;
+    el.outputRes.value = String(s.outputRes);
 
     $$(".preset").forEach((button) => {
       button.classList.toggle("is-active", button.dataset.preset === state.activePreset);
@@ -1121,7 +1126,7 @@
     return lines.join("\n");
   }
 
-  function makeOutputCanvas(longSide = 1920) {
+  function makeOutputCanvas(longSide = 2560) {
     if (!state.hasVideo) return null;
     const aspect = state.videoAspect || 16 / 9;
     let width;
@@ -1219,7 +1224,7 @@
     el.stageFrame.style.width = `${width}px`;
     el.stageFrame.style.height = `${height}px`;
 
-    const dpr = Math.min(window.devicePixelRatio || 1, 2, 2300 / width);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2.5, 3200 / width);
     const backingW = Math.max(2, Math.round(width * dpr));
     const backingH = Math.max(2, Math.round(height * dpr));
     if (el.canvas.width !== backingW || el.canvas.height !== backingH) {
@@ -1238,7 +1243,11 @@
   function tick(now) {
     requestAnimationFrame(tick);
 
-    if (state.recording && now - state.lastRecordAt >= 1000 / 30) {
+    const cells = state.grid.cols * state.grid.rows;
+    const heavyGrid = cells > 22000;
+    const recordInterval = heavyGrid ? 50 : 1000 / 30;
+
+    if (state.recording && now - state.lastRecordAt >= recordInterval) {
       state.lastRecordAt = now;
       renderRecordFrame();
     }
@@ -1252,7 +1261,14 @@
     }
 
     if (el.video.readyState < 2) return;
-    const frameInterval = state.recording ? 110 : 34;
+    let frameInterval = 34;
+    if (state.recording) {
+      frameInterval = heavyGrid ? 200 : 110;
+    } else if (cells > 18000) {
+      frameInterval = 66;
+    } else if (cells > 10000) {
+      frameInterval = 45;
+    }
     if ((state.needsRender || (!el.video.paused && !el.video.ended)) && now - state.lastPreviewAt >= frameInterval) {
       state.lastPreviewAt = now;
       renderPreview();
@@ -1405,7 +1421,7 @@
       if (wasPlaying) playVideo();
       return;
     }
-    const out = makeOutputCanvas(1920);
+    const out = makeOutputCanvas([1920, 2560, 3840].includes(state.settings.outputRes) ? state.settings.outputRes : 2560);
     if (!out) return;
     drawAsciiFrame(out.getContext("2d", { alpha: false }), out.width, out.height, state.grid.cols, state.grid.rows, data);
     const blob = await new Promise((resolve) => out.toBlob(resolve, "image/png"));
@@ -1537,6 +1553,22 @@
     return { start, end, duration, valid: end - start >= 0.025 };
   }
 
+  function getRecordDimensions(quality, aspect = state.videoAspect || 16 / 9) {
+    const shortSide = [720, 1080, 1440, 2160].includes(Number(quality)) ? Number(quality) : 1080;
+    let width;
+    let height;
+    if (aspect >= 1) {
+      height = shortSide;
+      width = Math.round(height * aspect);
+    } else {
+      width = shortSide;
+      height = Math.round(width / aspect);
+    }
+    width = Math.max(2, width - (width % 2));
+    height = Math.max(2, height - (height % 2));
+    return { width, height };
+  }
+
   function updateDialogSummary() {
     if (!state.dialogKind) return;
     const summaryMain = $(".summary-main", el.exportSummary);
@@ -1547,10 +1579,11 @@
       const fromBeginning = $('input[name="recordStart"]:checked')?.value === "beginning";
       const start = fromBeginning ? 0 : el.video.currentTime;
       const remaining = Math.max(0, el.video.duration - start);
-      const quality = `${el.recordQuality.value}p`;
+      const quality = Number.parseInt(el.recordQuality.value, 10) || 1080;
+      const dimensions = getRecordDimensions(quality);
       const audio = el.recordAudio.checked ? "含声音轨" : "无声音轨";
-      summaryMain.textContent = `预计录制 ${formatTime(remaining)} · ${quality}`;
-      summarySub.textContent = `从 ${formatTime(start)} 开始 · ${audio} · 30 fps · ${state.grid.cols} × ${state.grid.rows} 字符`;
+      summaryMain.textContent = `预计录制 ${formatTime(remaining)} · ${quality}p · ${dimensions.width} × ${dimensions.height}`;
+      summarySub.textContent = `从 ${formatTime(start)} 开始 · ${audio} · 30 fps · ${state.grid.cols} × ${state.grid.rows} 字符${quality >= 2160 ? " · 4K 输出 WebM" : ""}`;
       if (remaining < 0.6) {
         summaryMain.textContent = "当前位置已接近视频结尾";
         summaryMain.classList.add("summary-warn");
@@ -2088,18 +2121,23 @@
      Recording
      ============================================================ */
 
-  function chooseRecorderMime() {
+  function chooseRecorderMime(quality = 1080) {
     if (typeof MediaRecorder === "undefined") return "";
-    const candidates = [
-      "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
-      "video/mp4;codecs=avc1.42E01E",
-      "video/mp4",
+    const webm = [
       "video/webm;codecs=vp9,opus",
       "video/webm;codecs=vp8,opus",
       "video/webm;codecs=vp9",
       "video/webm;codecs=vp8",
       "video/webm",
     ];
+    const mp4 = [
+      "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+      "video/mp4;codecs=avc1.42E01E",
+      "video/mp4",
+    ];
+    // H.264 MP4 is the best choice for 1080p/1440p. For 4K, VP9 WebM
+    // starts encoding more reliably in browsers and has broad support.
+    const candidates = quality >= 2160 ? [...webm, ...mp4] : [...mp4, ...webm];
     for (const type of candidates) {
       try {
         if (MediaRecorder.isTypeSupported(type)) return type;
@@ -2146,7 +2184,7 @@
 
   async function startRecording({ startAt, quality, includeAudio }) {
     if (state.recording) return;
-    const mime = chooseRecorderMime();
+    const mime = chooseRecorderMime(quality);
     if (!mime) {
       showToast("当前浏览器不支持 WebM 录制", "error");
       return;
@@ -2163,18 +2201,7 @@
       await seekVideo(startAt);
       await waitForVideoFrame();
 
-      const aspect = state.videoAspect || 16 / 9;
-      let width;
-      let height;
-      if (aspect >= 1) {
-        width = quality;
-        height = Math.round(width / aspect);
-      } else {
-        height = quality;
-        width = Math.round(height * aspect);
-      }
-      width = Math.max(2, width - (width % 2));
-      height = Math.max(2, height - (height % 2));
+      const { width, height } = getRecordDimensions(quality);
 
       const recordCanvas = document.createElement("canvas");
       recordCanvas.width = width;
@@ -2190,9 +2217,10 @@
         stream.addTrack(state.audioDest.stream.getAudioTracks()[0]);
       }
 
+      const videoBitrate = quality >= 2160 ? 24000000 : quality >= 1440 ? 18000000 : quality >= 1080 ? 10000000 : 5000000;
       const options = {
         mimeType: mime,
-        videoBitsPerSecond: quality >= 1440 ? 14000000 : quality >= 1080 ? 9000000 : 5000000,
+        videoBitsPerSecond: videoBitrate,
       };
       if (audioIncluded) options.audioBitsPerSecond = 128000;
 
@@ -2365,6 +2393,12 @@
     el.font.addEventListener("change", () => commitSettings({ font: el.font.value }));
     el.invert.addEventListener("change", () => commitSettings({ invert: el.invert.checked }));
     el.scanline.addEventListener("change", () => commitSettings({ scanline: el.scanline.checked }));
+    el.outputRes.addEventListener("change", () => {
+      const value = Number(el.outputRes.value) || 2560;
+      commitSettings({ outputRes: value });
+      const label = el.outputRes.selectedOptions[0]?.textContent || `${value}px`;
+      showToast(`截图分辨率：${label}`);
+    });
 
     el.playBtn.addEventListener("click", togglePlay);
     el.seek.addEventListener("pointerdown", () => { state.scrubbing = true; });

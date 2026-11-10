@@ -532,6 +532,52 @@ kbd {
   line-height: 1.45;
 }
 
+.resolution-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 13px;
+  padding-top: 13px;
+  border-top: 1px dashed rgba(232, 245, 222, 0.09);
+}
+
+.resolution-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--text-soft);
+  font-size: 10.5px;
+  font-weight: 550;
+}
+
+.resolution-copy small {
+  color: var(--muted-dim);
+  font-size: 8.5px;
+  font-weight: 400;
+}
+
+.resolution-row .resolution-select {
+  width: 88px;
+  flex: none;
+}
+
+.resolution-row .resolution-select select {
+  height: 32px;
+  padding-right: 25px;
+  padding-left: 9px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.resolution-row .resolution-select .select-chevron {
+  right: 7px;
+  width: 12px;
+  height: 12px;
+}
+
 /* Range controls */
 
 .range {
