@@ -191,6 +191,7 @@
   };
 
   const MAX_EXPORT_FRAMES = { zip: 2400, html: 1200 };
+  const MAX_CONVERT_FRAMES = { 720: 3600, 1080: 3000, 1440: 1800, 2160: 900 };
 
   /* ============================================================
      State and DOM
@@ -208,6 +209,8 @@
     needsRender: true,
     autoplayPending: false,
     objectUrl: null,
+    currentSrc: "",
+    currentIsDemo: false,
     currentName: "",
     videoWidth: 0,
     videoHeight: 0,
@@ -242,6 +245,14 @@
     lastPreviewAt: 0,
     lastIdleAt: 0,
     lastRecordAt: 0,
+    jobRunning: false,
+    jobAbort: false,
+    jobWorker: null,
+    jobChannel: null,
+    jobVideo: null,
+    jobHideTimer: 0,
+    jobSnapshot: null,
+    previewWasPlaying: false,
   };
 
   const el = {
@@ -312,6 +323,15 @@
     recordCurrentHint: null,
     recordQuality: null,
     recordAudio: null,
+    convertEnd: null,
+    convertFps: null,
+    jobPanel: null,
+    jobTitle: null,
+    jobStatus: null,
+    jobPercent: null,
+    jobBar: null,
+    jobDetail: null,
+    jobCancel: null,
     exportSummary: null,
     dialogNote: null,
     exportProgress: null,
@@ -393,6 +413,15 @@
     el.recordCurrentHint = $("#recordCurrentHint");
     el.recordQuality = $("#recordQuality");
     el.recordAudio = $("#recordAudio");
+    el.convertEnd = $("#convertEnd");
+    el.convertFps = $("#convertFps");
+    el.jobPanel = $("#jobPanel");
+    el.jobTitle = $("#jobTitle");
+    el.jobStatus = $("#jobStatus");
+    el.jobPercent = $("#jobPercent");
+    el.jobBar = $("#jobBar");
+    el.jobDetail = $("#jobDetail");
+    el.jobCancel = $("#jobCancel");
     el.exportSummary = $("#exportSummary");
     el.dialogNote = $("#dialogNote");
     el.exportProgress = $("#exportProgress");
@@ -887,6 +916,10 @@
       showToast("请先停止录制，再导入新视频", "error");
       return;
     }
+    if (state.jobRunning) {
+      showToast("后台转换进行中，请等待完成或取消后再更换视频", "error");
+      return;
+    }
     if (state.exporting) return;
 
     if (state.objectUrl) {
@@ -896,6 +929,8 @@
 
     const token = ++state.loadToken;
     state.currentName = label;
+    state.currentSrc = src;
+    state.currentIsDemo = demo;
     state.loading = true;
     state.hasVideo = false;
     state.ready = false;
@@ -982,6 +1017,10 @@
 
   function loadFile(file) {
     if (!file) return;
+    if (state.jobRunning) {
+      showToast("后台转换进行中，请等待完成或取消后再导入", "error");
+      return;
+    }
     const name = file.name || "未命名视频";
     const isVideo = file.type.startsWith("video/") || /\.(mp4|webm|mov|m4v|ogv|ogg|mkv)$/i.test(name);
     if (!isVideo) {
@@ -1001,6 +1040,10 @@
       showToast("请先停止录制，再载入示例", "error");
       return;
     }
+    if (state.jobRunning) {
+      showToast("后台转换进行中，请等待完成或取消", "error");
+      return;
+    }
     if (IS_FILE_PROTOCOL) {
       showToast("示例需要本地服务：请双击「启动字符画工坊.bat」打开工具", "error");
       return;
@@ -1011,6 +1054,10 @@
   function openFilePicker() {
     if (state.recording) {
       showToast("请先停止录制，再导入新视频", "error");
+      return;
+    }
+    if (state.jobRunning) {
+      showToast("后台转换进行中，请等待完成或取消", "error");
       return;
     }
     if (state.exporting) return;
@@ -1055,10 +1102,10 @@
     }
   }
 
-  function mapPixelToValue(r, g, b) {
+  function mapPixelToValue(r, g, b, settings = state.settings) {
     let value = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
-    value = (value - 0.5) * (1 + state.settings.contrast / 100) + 0.5 + state.settings.brightness / 100;
-    if (state.settings.invert) value = 1 - value;
+    value = (value - 0.5) * (1 + settings.contrast / 100) + 0.5 + settings.brightness / 100;
+    if (settings.invert) value = 1 - value;
     return clamp(value, 0, 1);
   }
 
@@ -1067,9 +1114,9 @@
     return ramp[index];
   }
 
-  function drawAsciiFrame(ctx, width, height, cols, rows, data) {
-    const s = state.settings;
-    const ramp = getRamp();
+  function drawAsciiFrame(ctx, width, height, cols, rows, data, settingsOverride = null, rampOverride = null) {
+    const s = settingsOverride || state.settings;
+    const ramp = rampOverride || getRamp();
     ctx.save();
     ctx.fillStyle = s.bg;
     ctx.fillRect(0, 0, width, height);
@@ -1092,7 +1139,7 @@
         const r = data[offset];
         const g = data[offset + 1];
         const b = data[offset + 2];
-        const value = mapPixelToValue(r, g, b);
+        const value = mapPixelToValue(r, g, b, s);
         const char = chooseCharacter(value, ramp);
         if (!char || char === " " || char === "\u3000") continue;
         if (!isMono) ctx.fillStyle = `rgb(${r},${g},${b})`;
@@ -1492,16 +1539,21 @@
       showToast("请先停止录制", "error");
       return;
     }
+    if (kind === "convert" && state.jobRunning) {
+      showToast("已有后台转换任务正在运行", "error");
+      return;
+    }
 
     closeDialog(true);
+    state.previewWasPlaying = !el.video.paused && !el.video.ended;
     if (!el.video.paused) el.video.pause();
     state.dialogKind = kind;
     state.exportAbort = false;
     resetDialogUI();
 
-    const isRecord = kind === "record";
-    el.frameFields.hidden = isRecord;
-    el.recordFields.hidden = !isRecord;
+    const isConvert = kind === "convert";
+    el.frameFields.hidden = isConvert;
+    el.recordFields.hidden = !isConvert;
 
     const duration = Number.isFinite(el.video.duration) ? el.video.duration : 0;
     el.exportStart.max = formatSecondsInput(duration);
@@ -1509,16 +1561,19 @@
     el.exportStart.value = "0.0";
     el.exportEnd.value = formatSecondsInput(duration);
     el.exportFps.value = kind === "html" ? "12" : "10";
+    el.convertEnd.max = formatSecondsInput(duration);
+    el.convertEnd.value = formatSecondsInput(duration);
+    el.convertFps.value = "30";
     el.recordQuality.value = "1080";
     el.recordAudio.checked = true;
-    el.recordCurrentHint.textContent = `当前 ${formatTime(el.video.currentTime)}`;
+    el.recordCurrentHint.textContent = `当前 ${formatSecondsInput(el.video.currentTime)} 秒`;
     const currentStart = $$('input[name="recordStart"]').find((input) => input.value === "current");
     if (currentStart) currentStart.checked = true;
 
     const titles = {
       zip: ["导出全部帧文本", "FRAMES TO ZIP", "开始导出"],
       html: ["生成字符动画网页", "ANIMATED HTML", "生成网页"],
-      record: ["录制字符画视频", "RECORD WEBM", "开始录制"],
+      convert: ["生成字符画视频", "BACKGROUND MP4", "开始转换"],
     };
     const [title, kicker, startLabel] = titles[kind] || ["导出字符画", "EXPORT", "开始导出"];
     el.dialogTitle.textContent = title;
@@ -1528,7 +1583,7 @@
     const notes = {
       zip: "每一帧会保存为带编号的 TXT 文件，并打包为一个 ZIP。文本不含颜色，保留字符密度与版式。",
       html: "全部字符帧会内嵌进一个 HTML 文件，可双击离线播放。网页输出为单色字符动画。",
-      record: "录制会按当前画面设置实时进行，可包含视频原声。请保持页面处于前台，避免浏览器降频。",
+      convert: "转换在后台逐帧进行，完成后自动下载。输出标准 MP4（H.264 + AAC，Fast Start），可在 Windows 媒体播放器中拖动进度；转换使用开始时的画面设置，期间可以继续操作预览。",
     };
     let note = notes[kind] || "";
     if ((kind === "zip" || kind === "html") && state.settings.colorMode === "source") {
@@ -1575,20 +1630,37 @@
     const summarySub = $(".summary-sub", el.exportSummary);
     summaryMain.classList.remove("summary-warn");
 
-    if (state.dialogKind === "record") {
+    if (state.dialogKind === "convert") {
       const fromBeginning = $('input[name="recordStart"]:checked')?.value === "beginning";
-      const start = fromBeginning ? 0 : el.video.currentTime;
-      const remaining = Math.max(0, el.video.duration - start);
+      const duration = Number.isFinite(el.video.duration) ? el.video.duration : 0;
+      const start = fromBeginning ? 0 : clamp(el.video.currentTime, 0, duration);
+      let end = Number.parseFloat(el.convertEnd.value);
+      if (!Number.isFinite(end)) end = duration;
+      end = clamp(end, 0, duration);
+      const fps = Number.parseInt(el.convertFps.value, 10) || 30;
       const quality = Number.parseInt(el.recordQuality.value, 10) || 1080;
       const dimensions = getRecordDimensions(quality);
       const audio = el.recordAudio.checked ? "含声音轨" : "无声音轨";
-      summaryMain.textContent = `预计录制 ${formatTime(remaining)} · ${quality}p · ${dimensions.width} × ${dimensions.height}`;
-      summarySub.textContent = `从 ${formatTime(start)} 开始 · ${audio} · 30 fps · ${state.grid.cols} × ${state.grid.rows} 字符${quality >= 2160 ? " · 4K 输出 WebM" : ""}`;
-      if (remaining < 0.6) {
-        summaryMain.textContent = "当前位置已接近视频结尾";
+      const seconds = Math.max(0, end - start);
+      const frames = seconds > 0 ? Math.max(1, Math.floor(seconds * fps + 0.0001)) : 0;
+      const maxFrames = MAX_CONVERT_FRAMES[quality] || 1800;
+
+      summaryMain.textContent = `预计 ${frames} 帧 · ${formatTime(seconds)} · ${quality}p`;
+      summarySub.textContent = `${dimensions.width} × ${dimensions.height} · ${fps} fps · ${audio} · ${state.grid.cols} × ${state.grid.rows} 字符 · 标准 MP4`;
+
+      if (seconds < 0.08) {
+        summaryMain.textContent = "转换范围无效";
         summaryMain.classList.add("summary-warn");
+        summarySub.textContent = "结束时间需要大于开始时间";
+        el.dialogStart.disabled = true;
+      } else if (frames > maxFrames) {
+        summaryMain.textContent = `帧数过多 · ${frames} / 上限 ${maxFrames}`;
+        summaryMain.classList.add("summary-warn");
+        summarySub.textContent = "请缩短结束时间，或降低输出画质";
+        el.dialogStart.disabled = true;
+      } else {
+        el.dialogStart.disabled = false;
       }
-      el.dialogStart.disabled = remaining < 0.6;
       return;
     }
 
@@ -1797,8 +1869,8 @@
 
   function handleDialogStart() {
     if (!state.dialogKind || state.dialogBusy) return;
-    if (state.dialogKind === "record") {
-      startRecordingFromDialog();
+    if (state.dialogKind === "convert") {
+      startConversionFromDialog();
     } else {
       runFrameExport(state.dialogKind);
     }
@@ -2115,6 +2187,528 @@
 </script>
 </body>
 </html>`;
+  }
+
+  /* ============================================================
+     Background MP4 conversion
+     ============================================================ */
+
+  function getConversionCodec(quality) {
+    if (quality >= 2160) return "avc1.420033";
+    if (quality >= 1440) return "avc1.420032";
+    if (quality >= 1080) return "avc1.420028";
+    return "avc1.42001f";
+  }
+
+  function getConversionBitrate(quality) {
+    if (quality >= 2160) return 24000000;
+    if (quality >= 1440) return 18000000;
+    if (quality >= 1080) return 10000000;
+    return 5000000;
+  }
+
+  function getMaxConvertFrames(quality) {
+    return MAX_CONVERT_FRAMES[quality] || 1800;
+  }
+
+  function clearJobHideTimer() {
+    if (state.jobHideTimer) {
+      window.clearTimeout(state.jobHideTimer);
+      state.jobHideTimer = 0;
+    }
+  }
+
+  function showJobPanel() {
+    clearJobHideTimer();
+    el.jobPanel.hidden = false;
+    el.jobPanel.classList.remove("is-done", "is-error");
+    el.jobTitle.textContent = "后台转换中";
+    el.jobCancel.hidden = false;
+    updateJobPanel(0, "准备中…", "正在初始化后台编码器");
+  }
+
+  function updateJobPanel(percent, status, detail) {
+    const safe = clamp(percent, 0, 100);
+    el.jobBar.style.width = `${safe}%`;
+    el.jobPercent.textContent = `${Math.round(safe)}%`;
+    if (status) el.jobStatus.textContent = status;
+    if (detail !== undefined) el.jobDetail.textContent = detail;
+  }
+
+  function completeJobPanel(status, detail) {
+    clearJobHideTimer();
+    el.jobPanel.classList.remove("is-error");
+    el.jobPanel.classList.add("is-done");
+    el.jobTitle.textContent = "转换完成";
+    el.jobCancel.hidden = true;
+    updateJobPanel(100, status, detail);
+    state.jobHideTimer = window.setTimeout(() => {
+      el.jobPanel.hidden = true;
+    }, 8000);
+  }
+
+  function failJobPanel(message, detail) {
+    clearJobHideTimer();
+    el.jobPanel.classList.remove("is-done");
+    el.jobPanel.classList.add("is-error");
+    el.jobTitle.textContent = "转换失败";
+    el.jobCancel.hidden = true;
+    updateJobPanel(0, message, detail || "请尝试降低画质或缩短转换范围");
+    state.jobHideTimer = window.setTimeout(() => {
+      el.jobPanel.hidden = true;
+    }, 10000);
+  }
+
+  function hideJobPanel() {
+    clearJobHideTimer();
+    el.jobPanel.hidden = true;
+    el.jobPanel.classList.remove("is-done", "is-error");
+    el.jobCancel.hidden = false;
+  }
+
+  function createConversionWorker() {
+    const worker = new Worker("converter-worker.js", { type: "module" });
+    const ackMap = new Map();
+    let readyResolve;
+    let readyReject;
+    let doneResolve;
+    let doneReject;
+
+    const ready = new Promise((resolve, reject) => {
+      readyResolve = resolve;
+      readyReject = reject;
+    });
+    const done = new Promise((resolve, reject) => {
+      doneResolve = resolve;
+      doneReject = reject;
+    });
+    done.catch(() => {});
+
+    const failAll = (error) => {
+      try { readyReject(error); } catch (_) {}
+      try { doneReject(error); } catch (_) {}
+      for (const pending of ackMap.values()) {
+        try { pending.reject(error); } catch (_) {}
+      }
+      ackMap.clear();
+    };
+
+    worker.onmessage = (event) => {
+      const message = event.data || {};
+      if (message.type === "ready") {
+        readyResolve(message);
+      } else if (message.type === "frameAck") {
+        const pending = ackMap.get(message.index);
+        if (pending) {
+          ackMap.delete(message.index);
+          pending.resolve(message);
+        }
+      } else if (message.type === "done") {
+        doneResolve(message);
+      } else if (message.type === "error") {
+        failAll(new Error(message.message || "后台编码失败"));
+      }
+    };
+    worker.onerror = (event) => {
+      failAll(new Error(event.message || "后台编码器异常"));
+    };
+
+    return {
+      worker,
+      ready,
+      done,
+      sendVideo(frame, index, keyFrame) {
+        return new Promise((resolve, reject) => {
+          ackMap.set(index, { resolve, reject });
+          try {
+            worker.postMessage({ type: "video", frame, index, keyFrame }, [frame]);
+          } catch (error) {
+            ackMap.delete(index);
+            try { frame.close(); } catch (_) {}
+            reject(error);
+          }
+        });
+      },
+      sendAudio(data, frames, timestamp) {
+        worker.postMessage({ type: "audio", data, frames, timestamp }, [data.buffer]);
+      },
+      finish() {
+        worker.postMessage({ type: "finish" });
+      },
+      terminate() {
+        try { worker.terminate(); } catch (_) {}
+        failAll(new DOMException("Aborted", "AbortError"));
+      },
+    };
+  }
+
+  function createHiddenConversionVideo(src) {
+    return new Promise((resolve, reject) => {
+      const video = document.createElement("video");
+      video.muted = true;
+      video.playsInline = true;
+      video.preload = "auto";
+      video.src = src;
+      video.style.cssText = "position:fixed;left:-10000px;top:-10000px;width:2px;height:2px;opacity:0;pointer-events:none;";
+      document.body.appendChild(video);
+
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(video);
+      };
+      const fail = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        try {
+          video.removeAttribute("src");
+          video.load();
+          video.remove();
+        } catch (_) {}
+        const code = video.error?.code;
+        reject(new Error(code === 4 ? "浏览器不支持该视频编码" : "无法读取视频进行转换"));
+      };
+      const cleanup = () => {
+        video.removeEventListener("loadeddata", finish);
+        video.removeEventListener("error", fail);
+        window.clearTimeout(timer);
+      };
+      const timer = window.setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        try {
+          video.removeAttribute("src");
+          video.load();
+          video.remove();
+        } catch (_) {}
+        reject(new Error("视频加载超时"));
+      }, 20000);
+
+      video.addEventListener("loadeddata", finish, { once: true });
+      video.addEventListener("error", fail, { once: true });
+      try {
+        video.load();
+      } catch (_) {
+        fail();
+      }
+    });
+  }
+
+  async function seekConversionVideo(video, time) {
+    if (Math.abs(video.currentTime - time) < 0.003 && video.readyState >= 2) {
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      return;
+    }
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        video.removeEventListener("seeked", onSeeked);
+        video.removeEventListener("error", onError);
+        window.clearTimeout(timer);
+      };
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      const fail = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new Error("视频定位失败"));
+      };
+      const onSeeked = () => finish();
+      const onError = () => fail();
+      const timer = window.setTimeout(fail, 8000);
+      video.addEventListener("seeked", onSeeked);
+      video.addEventListener("error", onError);
+      try {
+        const duration = Number.isFinite(video.duration) ? video.duration : time + 1;
+        video.currentTime = clamp(time, 0, Math.max(0, duration - 0.001));
+      } catch (_) {
+        fail();
+      }
+    });
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  }
+
+  async function prepareConversionAudio(src, startAt, duration) {
+    const response = await fetch(src);
+    if (!response.ok) throw new Error("无法读取音频");
+    const bytes = await response.arrayBuffer();
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) throw new Error("当前浏览器不支持音频解析");
+    const context = new AudioContextClass();
+    try {
+      const decoded = await context.decodeAudioData(bytes);
+      if (!decoded || !decoded.length) return null;
+      const playable = Math.min(duration, Math.max(0, decoded.duration - startAt));
+      if (playable < 0.05) return null;
+
+      const sampleRate = 48000;
+      const audioFrames = Math.max(1, Math.ceil(playable * sampleRate));
+      const offline = new OfflineAudioContext(2, audioFrames, sampleRate);
+      const source = offline.createBufferSource();
+      source.buffer = decoded;
+      source.connect(offline.destination);
+      source.start(0, startAt, playable);
+      const rendered = await offline.startRendering();
+      return {
+        sampleRate,
+        channels: 2,
+        length: rendered.length,
+        channelsData: [rendered.getChannelData(0), rendered.getChannelData(1)],
+      };
+    } finally {
+      try { await context.close(); } catch (_) {}
+    }
+  }
+
+  async function sendConversionAudio(channel, audio) {
+    const chunkFrames = 4800;
+    let offset = 0;
+    let chunks = 0;
+    while (offset < audio.length) {
+      if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
+      const count = Math.min(chunkFrames, audio.length - offset);
+      const planar = new Float32Array(count * 2);
+      planar.set(audio.channelsData[0].subarray(offset, offset + count), 0);
+      planar.set(audio.channelsData[1].subarray(offset, offset + count), count);
+      channel.sendAudio(planar, count, Math.round((offset / audio.sampleRate) * 1e6));
+      offset += count;
+      chunks += 1;
+      if (chunks % 20 === 0) {
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+      }
+    }
+  }
+
+  function cleanupConversionJob() {
+    if (state.jobChannel) {
+      try { state.jobChannel.terminate(); } catch (_) {}
+      state.jobChannel = null;
+    }
+    if (state.jobWorker) {
+      try { state.jobWorker.terminate(); } catch (_) {}
+      state.jobWorker = null;
+    }
+    if (state.jobVideo) {
+      try {
+        state.jobVideo.pause();
+        state.jobVideo.removeAttribute("src");
+        state.jobVideo.load();
+        state.jobVideo.remove();
+      } catch (_) {}
+      state.jobVideo = null;
+    }
+    state.jobRunning = false;
+    state.jobAbort = false;
+    state.jobSnapshot = null;
+  }
+
+  function cancelConversionJob() {
+    if (!state.jobRunning) return;
+    state.jobAbort = true;
+    if (state.jobChannel) {
+      try { state.jobChannel.terminate(); } catch (_) {}
+    }
+    if (state.jobWorker) {
+      try { state.jobWorker.terminate(); } catch (_) {}
+    }
+    hideJobPanel();
+    showToast("正在取消后台转换…");
+  }
+
+  function startConversionFromDialog() {
+    if (!state.hasVideo || !state.ready) return;
+    if (state.jobRunning) {
+      showToast("已有后台转换任务正在运行", "error");
+      return;
+    }
+    if (IS_FILE_PROTOCOL) {
+      showToast("后台转换需要通过「启动字符画工坊.bat」打开工具", "error");
+      return;
+    }
+    if (typeof VideoEncoder === "undefined") {
+      showToast("当前浏览器不支持后台 MP4 转换，请使用最新版 Edge 或 Chrome", "error");
+      return;
+    }
+
+    const fromBeginning = $('input[name="recordStart"]:checked')?.value === "beginning";
+    const duration = Number.isFinite(el.video.duration) ? el.video.duration : 0;
+    const start = fromBeginning ? 0 : clamp(el.video.currentTime, 0, duration);
+    let end = Number.parseFloat(el.convertEnd.value);
+    if (!Number.isFinite(end)) end = duration;
+    end = clamp(end, 0, duration);
+    const fps = Number.parseInt(el.convertFps.value, 10) || 30;
+    const quality = Number.parseInt(el.recordQuality.value, 10) || 1080;
+    const includeAudio = el.recordAudio.checked;
+
+    if (end - start < 0.08) {
+      showToast("结束时间需要大于开始时间", "error");
+      return;
+    }
+    const frames = Math.max(1, Math.floor((end - start) * fps + 0.0001));
+    const maxFrames = getMaxConvertFrames(quality);
+    if (frames > maxFrames) {
+      showToast(`帧数超过上限（${maxFrames} 帧），请缩短范围或降低画质`, "error");
+      return;
+    }
+
+    closeDialog(true);
+    startBackgroundConversion({ start, end, fps, quality, includeAudio, frames });
+    if (state.previewWasPlaying) playVideo();
+    state.previewWasPlaying = false;
+  }
+
+  async function startBackgroundConversion({ start, end, fps, quality, includeAudio, frames }) {
+    if (state.jobRunning) return;
+    const src = state.currentSrc || el.video.currentSrc;
+    if (!src) {
+      showToast("找不到可转换的视频源", "error");
+      return;
+    }
+
+    state.jobRunning = true;
+    state.jobAbort = false;
+    showJobPanel();
+    const settings = { ...state.settings };
+    const ramp = getRamp().slice();
+    const grid = { ...state.grid };
+    const dims = getRecordDimensions(quality);
+    const codec = getConversionCodec(quality);
+    const bitrate = getConversionBitrate(quality);
+    const codecConfig = {
+      codec,
+      width: dims.width,
+      height: dims.height,
+      bitrate,
+      framerate: fps,
+      avc: { format: "avc" },
+    };
+    state.jobSnapshot = { settings, ramp, grid, start, end, fps, quality, frames, src };
+
+    let hiddenVideo = null;
+    let channel = null;
+    let audio = null;
+
+    try {
+      updateJobPanel(1, "正在检查编码能力…", `${dims.width} × ${dims.height} · H.264`);
+      const support = await VideoEncoder.isConfigSupported(codecConfig);
+      if (!support.supported) {
+        throw new Error(`当前浏览器不支持 ${dims.width}×${dims.height} 的 H.264 编码`);
+      }
+      if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
+
+      updateJobPanel(3, "正在加载视频…", "准备后台解码");
+      hiddenVideo = await createHiddenConversionVideo(src);
+      state.jobVideo = hiddenVideo;
+      if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
+
+      if (includeAudio) {
+        updateJobPanel(6, "正在解析音轨…", "读取原视频中的声音");
+        try {
+          audio = await prepareConversionAudio(src, start, frames / fps);
+        } catch (error) {
+          console.warn("Audio preparation failed:", error);
+          audio = null;
+        }
+        if (!audio) updateJobPanel(9, "未发现可转换音轨", "将继续生成无声视频");
+      }
+
+      updateJobPanel(11, "正在初始化编码器…", `${dims.width} × ${dims.height} · ${fps} fps`);
+      channel = createConversionWorker();
+      state.jobChannel = channel;
+      state.jobWorker = channel.worker;
+      channel.worker.postMessage({
+        type: "init",
+        width: dims.width,
+        height: dims.height,
+        fps,
+        bitrate,
+        codec,
+        totalFrames: frames,
+        hasAudio: Boolean(audio),
+        sampleRate: audio?.sampleRate || 48000,
+        channels: audio?.channels || 2,
+      });
+      await channel.ready;
+      if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
+
+      if (audio) {
+        updateJobPanel(13, "正在编码音轨…", `${audio.sampleRate} Hz · ${audio.channels} 声道`);
+        await sendConversionAudio(channel, audio);
+      }
+
+      const outputCanvas = document.createElement("canvas");
+      outputCanvas.width = dims.width;
+      outputCanvas.height = dims.height;
+      const outputCtx = outputCanvas.getContext("2d", { alpha: false });
+      outputCtx.imageSmoothingEnabled = true;
+
+      const sampleCanvas = document.createElement("canvas");
+      sampleCanvas.width = grid.cols;
+      sampleCanvas.height = grid.rows;
+      const sampleCtx = sampleCanvas.getContext("2d", { willReadFrequently: true });
+      sampleCtx.imageSmoothingEnabled = true;
+
+      const frameDuration = Math.round(1e6 / fps);
+      for (let index = 0; index < frames; index += 1) {
+        if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
+        const time = start + index / fps;
+        const percent = 14 + ((index + 1) / frames) * 80;
+        updateJobPanel(
+          percent,
+          `正在转换第 ${index + 1} / ${frames} 帧`,
+          `${formatTime(time)} / ${formatTime(end)} · 使用开始时的画面设置`,
+        );
+
+        await seekConversionVideo(hiddenVideo, time);
+        if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
+
+        sampleCtx.drawImage(hiddenVideo, 0, 0, grid.cols, grid.rows);
+        const pixels = sampleCtx.getImageData(0, 0, grid.cols, grid.rows).data;
+        drawAsciiFrame(outputCtx, outputCanvas.width, outputCanvas.height, grid.cols, grid.rows, pixels, settings, ramp);
+
+        const frame = new VideoFrame(outputCanvas, {
+          timestamp: Math.round((index * 1e6) / fps),
+          duration: frameDuration,
+        });
+        await channel.sendVideo(frame, index, index % fps === 0);
+        if (index % 2 === 0) {
+          await new Promise((resolve) => requestAnimationFrame(resolve));
+        }
+      }
+
+      if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
+      updateJobPanel(96, "正在封装 MP4…", `共 ${frames} 帧 · Fast Start`);
+      channel.finish();
+      const result = await channel.done;
+      if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
+
+      const blob = new Blob([result.buffer], { type: "video/mp4" });
+      const base = safeBaseName(state.currentName);
+      downloadBlob(blob, `${base}_字符画_${quality}p_${fps}fps_${timestamp()}.mp4`);
+      const audioLabel = audio ? "含音轨" : "无音轨";
+      completeJobPanel(`已完成 · ${formatBytes(blob.size)}`, `${dims.width} × ${dims.height} · ${frames} 帧 · ${audioLabel} · 可拖动进度`);
+      showToast(`MP4 已生成 · ${dims.width} × ${dims.height} · ${formatBytes(blob.size)}${audio ? "" : " · 无音轨"}`);
+    } catch (error) {
+      if (state.jobAbort || (error && error.name === "AbortError")) {
+        hideJobPanel();
+        showToast("已取消后台转换");
+      } else {
+        console.error("Background conversion failed:", error);
+        failJobPanel(error.message || "后台转换失败", `${dims.width} × ${dims.height} · 请尝试降低画质或缩短范围`);
+        showToast(`转换失败：${error.message || "未知错误"}`, "error");
+      }
+    } finally {
+      cleanupConversionJob();
+    }
   }
 
   /* ============================================================
@@ -2482,6 +3076,8 @@
     $$('input[name="recordStart"]').forEach((input) => input.addEventListener("change", updateDialogSummary));
     el.recordQuality.addEventListener("change", updateDialogSummary);
     el.recordAudio.addEventListener("change", updateDialogSummary);
+    el.convertEnd.addEventListener("input", updateDialogSummary);
+    el.convertFps.addEventListener("change", updateDialogSummary);
 
     el.video.addEventListener("play", () => {
       el.loadingState.hidden = true;
@@ -2525,6 +3121,7 @@
     el.peekBtn.addEventListener("blur", stopPeek);
 
     el.stopRecordBtn.addEventListener("click", () => stopRecording(true));
+    el.jobCancel.addEventListener("click", cancelConversionJob);
 
     el.stageFrame.addEventListener("dblclick", (event) => {
       if (!state.hasVideo) return;
@@ -2665,6 +3262,9 @@
       if (state.recording) {
         try { state.recordRecorder?.stop(); } catch (_) { /* Ignore. */ }
       }
+      try {
+        if (state.jobChannel) state.jobChannel.terminate();
+      } catch (_) { /* Ignore. */ }
     });
   }
 

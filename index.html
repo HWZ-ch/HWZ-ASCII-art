@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <meta name="theme-color" content="#0a0c0a">
-  <meta name="description" content="字符映画：把视频实时转换成连续字符画。支持多种字符集、彩色字符、PNG/TXT/ZIP/HTML 导出与 WebM 录制，全程本地处理。">
+  <meta name="description" content="字符映画：把视频实时转换成连续字符画。支持多种字符集、彩色字符、PNG/TXT/ZIP/HTML 导出，以及可拖动进度的后台 MP4 转换，全程本地处理。">
   <title>字符映画 · 视频转字符画</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230a0c0a'/%3E%3Cpath d='M14 20h10v24H14zm13 0h10v14H27zm13 0h10v24H40z' fill='%23c9f76f'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="styles.css">
@@ -372,10 +372,10 @@
                   <span class="menu-copy"><strong>字符动画网页</strong><small>可离线播放的 HTML</small></span>
                   <span class="menu-ext">.html</span>
                 </button>
-                <button type="button" data-export="record">
+                <button type="button" data-export="convert">
                   <span class="menu-icon menu-icon-rec"><svg class="icon"><use href="#i-video"></use></svg></span>
-                  <span class="menu-copy"><strong>录制字符画视频</strong><small>WebM · 可包含原声</small></span>
-                  <span class="menu-ext">.webm</span>
+                  <span class="menu-copy"><strong>生成字符画视频</strong><small>后台逐帧转换 · 标准 MP4</small></span>
+                  <span class="menu-ext">.mp4</span>
                 </button>
               </div>
             </div>
@@ -447,18 +447,35 @@
             </label>
             <label class="choice">
               <input type="radio" name="recordStart" value="beginning">
-              <span><strong>从头开始</strong><small>完整录制整段视频</small></span>
+              <span><strong>从头开始</strong><small>从 0:00 开始转换</small></span>
             </label>
           </div>
         </div>
         <label class="field">
-          <span>录制画质</span>
+          <span>结束时间</span>
+          <span class="input-unit">
+            <input id="convertEnd" type="number" min="0" step="0.1" value="0">
+            <em>秒</em>
+          </span>
+        </label>
+        <label class="field">
+          <span>输出画质</span>
           <span class="select-wrap">
             <select id="recordQuality">
               <option value="720">720p</option>
               <option value="1080" selected>1080p</option>
               <option value="1440">1440p</option>
               <option value="2160">2160p · 4K</option>
+            </select>
+            <svg class="icon select-chevron"><use href="#i-chevron"></use></svg>
+          </span>
+        </label>
+        <label class="field">
+          <span>转换帧率</span>
+          <span class="select-wrap">
+            <select id="convertFps">
+              <option value="24">24 fps · 电影感</option>
+              <option value="30" selected>30 fps · 流畅</option>
             </select>
             <svg class="icon select-chevron"><use href="#i-chevron"></use></svg>
           </span>
@@ -497,6 +514,22 @@
       </button>
     </div>
   </dialog>
+
+  <div class="job-panel" id="jobPanel" hidden aria-live="polite">
+    <div class="job-head">
+      <span class="job-dot"></span>
+      <strong id="jobTitle">后台转换中</strong>
+      <button class="icon-btn" id="jobCancel" type="button" aria-label="取消转换" title="取消转换">
+        <svg class="icon"><use href="#i-close"></use></svg>
+      </button>
+    </div>
+    <div class="job-progress"><span id="jobBar"></span></div>
+    <div class="job-meta">
+      <span id="jobStatus">准备中…</span>
+      <b id="jobPercent">0%</b>
+    </div>
+    <div class="job-detail" id="jobDetail">逐帧生成字符画面，完成后自动下载</div>
+  </div>
 
   <div class="toast-stack" id="toastStack" aria-live="polite"></div>
 

@@ -2100,6 +2100,126 @@ body.is-dragging .stage-frame {
   animation: toastOut 0.18s ease both;
 }
 
+/* ---------- Background conversion job ---------- */
+
+.job-panel {
+  position: fixed;
+  right: 22px;
+  bottom: 104px;
+  z-index: 90;
+  width: 318px;
+  padding: 12px 13px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: rgba(20, 24, 19, 0.97);
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(12px);
+  animation: menuIn 0.18s ease both;
+}
+
+.job-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 9px;
+}
+
+.job-head strong {
+  flex: 1;
+  color: var(--text-soft);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.job-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: livePulse 1.4s ease-in-out infinite;
+}
+
+.job-head .icon-btn {
+  width: 23px;
+  height: 23px;
+  border-radius: 6px;
+}
+
+.job-head .icon-btn .icon {
+  width: 13px;
+  height: 13px;
+}
+
+.job-progress {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: #2a3027;
+}
+
+.job-progress span {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: 99px;
+  background: linear-gradient(90deg, var(--accent), #8fd7a8);
+  transition: width 0.18s ease;
+}
+
+.job-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 8.5px;
+}
+
+.job-meta b {
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 500;
+}
+
+.job-detail {
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--muted-dim);
+  font-size: 8px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job-panel.is-done {
+  border-color: var(--accent-line);
+}
+
+.job-panel.is-done .job-dot {
+  background: var(--accent);
+  animation: none;
+}
+
+.job-panel.is-error {
+  border-color: rgba(255, 111, 91, 0.42);
+}
+
+.job-panel.is-error .job-dot {
+  background: var(--danger);
+  animation: none;
+}
+
+.job-panel.is-error .job-meta b {
+  color: var(--danger);
+}
+
+.job-panel.is-error .job-progress span {
+  background: var(--danger);
+}
+
 /* ---------- Responsive ---------- */
 
 @media (max-width: 1180px) {
@@ -2344,6 +2464,13 @@ body.is-dragging .stage-frame {
 
   .toast-stack {
     bottom: 116px;
+  }
+
+  .job-panel {
+    right: 9px;
+    bottom: 10px;
+    left: 9px;
+    width: auto;
   }
 
   .dialog-fields {
