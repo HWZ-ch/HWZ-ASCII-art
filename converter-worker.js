@@ -1,7 +1,10 @@
-import { Muxer, ArrayBufferTarget } from "./vendor/mp4-muxer.mjs";
+import { Muxer, ArrayBufferTarget, FileSystemWritableFileStreamTarget } from "./vendor/mp4-muxer.mjs";
 
 let muxer = null;
 let target = null;
+let writable = null;
+let fileHandle = null;
+let streaming = false;
 let videoEncoder = null;
 let audioEncoder = null;
 let hasAudio = false;
@@ -45,6 +48,8 @@ async function init(message) {
   videoChunks = 0;
   audioChunks = 0;
   finalized = false;
+  streaming = Boolean(message.fileHandle);
+  fileHandle = message.fileHandle || null;
 
   const videoConfig = {
     codec,
@@ -59,12 +64,25 @@ async function init(message) {
     throw new Error(`当前浏览器不支持 ${width}×${height} 的 H.264 编码`);
   }
 
-  target = new ArrayBufferTarget();
+  if (streaming) {
+    writable = await fileHandle.createWritable();
+    target = new FileSystemWritableFileStreamTarget(writable, { chunkSize: 8 * 1024 * 1024 });
+  } else {
+    target = new ArrayBufferTarget();
+  }
+
+  const fastStart = streaming
+    ? {
+        expectedVideoChunks: message.expectedVideoChunks || message.totalFrames || 1,
+        ...(hasAudio ? { expectedAudioChunks: message.expectedAudioChunks || 100000 } : {}),
+      }
+    : "in-memory";
+
   muxer = new Muxer({
     target,
     video: { codec: "avc", width, height, frameRate: fps },
     audio: hasAudio ? { codec: "aac", numberOfChannels: channels, sampleRate } : undefined,
-    fastStart: "in-memory",
+    fastStart,
     firstTimestampBehavior: "strict",
   });
 
@@ -152,22 +170,41 @@ async function finish() {
   }
   if (!videoChunks) throw new Error("没有生成任何视频帧");
   muxer.finalize();
-  const buffer = target.buffer;
-  post("done", {
-    buffer,
-    size: buffer.byteLength,
-    videoChunks,
-    audioChunks,
-  }, [buffer]);
-  target = null;
   muxer = null;
+
+  if (streaming) {
+    await writable.close();
+    writable = null;
+    const file = await fileHandle.getFile();
+    post("done", {
+      streaming: true,
+      size: file.size,
+      videoChunks,
+      audioChunks,
+    });
+  } else {
+    const buffer = target.buffer;
+    post("done", {
+      streaming: false,
+      buffer,
+      size: buffer.byteLength,
+      videoChunks,
+      audioChunks,
+    }, [buffer]);
+    target = null;
+  }
+  fileHandle = null;
 }
 
 function cleanup() {
   try { if (videoEncoder && videoEncoder.state !== "closed") videoEncoder.close(); } catch (_) {}
   try { if (audioEncoder && audioEncoder.state !== "closed") audioEncoder.close(); } catch (_) {}
+  try { if (writable) writable.abort(); } catch (_) {}
   videoEncoder = null;
   audioEncoder = null;
   muxer = null;
   target = null;
+  writable = null;
+  fileHandle = null;
+  streaming = false;
 }

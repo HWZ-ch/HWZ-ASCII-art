@@ -252,6 +252,9 @@
     jobVideo: null,
     jobHideTimer: 0,
     jobSnapshot: null,
+    jobFileHandle: null,
+    jobFileName: "",
+    jobFileRoot: null,
     previewWasPlaying: false,
   };
 
@@ -1583,7 +1586,9 @@
     const notes = {
       zip: "每一帧会保存为带编号的 TXT 文件，并打包为一个 ZIP。文本不含颜色，保留字符密度与版式。",
       html: "全部字符帧会内嵌进一个 HTML 文件，可双击离线播放。网页输出为单色字符动画。",
-      convert: "转换在后台逐帧进行，完成后自动下载。输出标准 MP4（H.264 + AAC，Fast Start），可在 Windows 媒体播放器中拖动进度；转换使用开始时的画面设置，期间可以继续操作预览。",
+      convert: supportsStreamingConversion()
+        ? "转换在后台逐帧进行，使用磁盘流式写入，帧数不设上限，完成后自动下载。输出标准 MP4（H.264 + AAC，Fast Start），可在 Windows 媒体播放器中拖动进度；转换使用开始时的画面设置，期间可以继续操作预览。"
+        : "当前浏览器不支持磁盘流式写入，将使用内存模式转换，帧数受画质上限限制。建议使用最新版 Edge 或 Chrome。",
     };
     let note = notes[kind] || "";
     if ((kind === "zip" || kind === "html") && state.settings.colorMode === "source") {
@@ -1643,17 +1648,18 @@
       const audio = el.recordAudio.checked ? "含声音轨" : "无声音轨";
       const seconds = Math.max(0, end - start);
       const frames = seconds > 0 ? Math.max(1, Math.floor(seconds * fps + 0.0001)) : 0;
-      const maxFrames = MAX_CONVERT_FRAMES[quality] || 1800;
+      const maxFrames = getMaxConvertFrames(quality);
+      const unlimited = !Number.isFinite(maxFrames);
 
       summaryMain.textContent = `预计 ${frames} 帧 · ${formatTime(seconds)} · ${quality}p`;
-      summarySub.textContent = `${dimensions.width} × ${dimensions.height} · ${fps} fps · ${audio} · ${state.grid.cols} × ${state.grid.rows} 字符 · 标准 MP4`;
+      summarySub.textContent = `${dimensions.width} × ${dimensions.height} · ${fps} fps · ${audio} · ${state.grid.cols} × ${state.grid.rows} 字符 · ${unlimited ? "流式写入磁盘 · 无帧数上限" : "标准 MP4"}`;
 
       if (seconds < 0.08) {
         summaryMain.textContent = "转换范围无效";
         summaryMain.classList.add("summary-warn");
         summarySub.textContent = "结束时间需要大于开始时间";
         el.dialogStart.disabled = true;
-      } else if (frames > maxFrames) {
+      } else if (!unlimited && frames > maxFrames) {
         summaryMain.textContent = `帧数过多 · ${frames} / 上限 ${maxFrames}`;
         summaryMain.classList.add("summary-warn");
         summarySub.textContent = "请缩短结束时间，或降低输出画质";
@@ -2193,6 +2199,57 @@
      Background MP4 conversion
      ============================================================ */
 
+  function supportsStreamingConversion() {
+    return Boolean(
+      navigator.storage &&
+      typeof navigator.storage.getDirectory === "function" &&
+      typeof FileSystemFileHandle !== "undefined",
+    );
+  }
+
+  async function cleanupOldOpfsOutputs() {
+    if (!supportsStreamingConversion() || state.jobRunning) return;
+    try {
+      const root = await navigator.storage.getDirectory();
+      for await (const [name, handle] of root.entries()) {
+        if (name.startsWith("hwz-ascii-") && name.endsWith(".mp4") && handle.kind === "file") {
+          try { await root.removeEntry(name); } catch (_) {}
+        }
+      }
+    } catch (_) {
+      /* Storage cleanup is best-effort. */
+    }
+  }
+
+  async function removeOpfsFile(name) {
+    if (!name) return;
+    try {
+      const root = await navigator.storage.getDirectory();
+      await root.removeEntry(name);
+    } catch (_) {
+      /* Already removed or storage unavailable. */
+    }
+  }
+
+  async function createOpfsOutput() {
+    const root = await navigator.storage.getDirectory();
+    const name = `hwz-ascii-${Date.now()}-${Math.floor(Math.random() * 100000)}.mp4`;
+    const handle = await root.getFileHandle(name, { create: true });
+    return { root, handle, name };
+  }
+
+  function downloadFile(file, filename) {
+    const url = URL.createObjectURL(file);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.style.display = "none";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 120000);
+  }
+
   function getConversionCodec(quality) {
     if (quality >= 2160) return "avc1.420033";
     if (quality >= 1440) return "avc1.420032";
@@ -2208,6 +2265,7 @@
   }
 
   function getMaxConvertFrames(quality) {
+    if (supportsStreamingConversion()) return Number.POSITIVE_INFINITY;
     return MAX_CONVERT_FRAMES[quality] || 1800;
   }
 
@@ -2509,6 +2567,9 @@
     state.jobRunning = false;
     state.jobAbort = false;
     state.jobSnapshot = null;
+    state.jobFileHandle = null;
+    state.jobFileRoot = null;
+    state.jobFileName = "";
   }
 
   function cancelConversionJob() {
@@ -2593,9 +2654,12 @@
     };
     state.jobSnapshot = { settings, ramp, grid, start, end, fps, quality, frames, src };
 
+    const useStreaming = supportsStreamingConversion();
     let hiddenVideo = null;
     let channel = null;
     let audio = null;
+    let opfs = null;
+    let completed = false;
 
     try {
       updateJobPanel(1, "正在检查编码能力…", `${dims.width} × ${dims.height} · H.264`);
@@ -2605,7 +2669,15 @@
       }
       if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
 
-      updateJobPanel(3, "正在加载视频…", "准备后台解码");
+      if (useStreaming) {
+        updateJobPanel(2, "正在创建磁盘文件…", "流式写入，帧数不设上限");
+        opfs = await createOpfsOutput();
+        state.jobFileHandle = opfs.handle;
+        state.jobFileRoot = opfs.root;
+        state.jobFileName = opfs.name;
+      }
+
+      updateJobPanel(3, "正在加载视频…", useStreaming ? "准备后台解码 · 流式写入磁盘" : "准备后台解码");
       hiddenVideo = await createHiddenConversionVideo(src);
       state.jobVideo = hiddenVideo;
       if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
@@ -2621,7 +2693,7 @@
         if (!audio) updateJobPanel(9, "未发现可转换音轨", "将继续生成无声视频");
       }
 
-      updateJobPanel(11, "正在初始化编码器…", `${dims.width} × ${dims.height} · ${fps} fps`);
+      updateJobPanel(11, "正在初始化编码器…", `${dims.width} × ${dims.height} · ${fps} fps${useStreaming ? " · 流式写入" : ""}`);
       channel = createConversionWorker();
       state.jobChannel = channel;
       state.jobWorker = channel.worker;
@@ -2636,6 +2708,9 @@
         hasAudio: Boolean(audio),
         sampleRate: audio?.sampleRate || 48000,
         channels: audio?.channels || 2,
+        fileHandle: opfs ? opfs.handle : null,
+        expectedVideoChunks: frames,
+        expectedAudioChunks: audio ? Math.ceil(audio.length / 512) + 64 : undefined,
       });
       await channel.ready;
       if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
@@ -2665,7 +2740,7 @@
         updateJobPanel(
           percent,
           `正在转换第 ${index + 1} / ${frames} 帧`,
-          `${formatTime(time)} / ${formatTime(end)} · 使用开始时的画面设置`,
+          `${formatTime(time)} / ${formatTime(end)} · 使用开始时的画面设置${useStreaming ? " · 写入磁盘" : ""}`,
         );
 
         await seekConversionVideo(hiddenVideo, time);
@@ -2691,13 +2766,35 @@
       const result = await channel.done;
       if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
 
-      const blob = new Blob([result.buffer], { type: "video/mp4" });
       const base = safeBaseName(state.currentName);
-      downloadBlob(blob, `${base}_字符画_${quality}p_${fps}fps_${timestamp()}.mp4`);
+      const filename = `${base}_字符画_${quality}p_${fps}fps_${timestamp()}.mp4`;
+      let outputSize = result.size || 0;
+
+      if (useStreaming && opfs) {
+        const file = await opfs.handle.getFile();
+        downloadFile(file, filename);
+        outputSize = file.size;
+        completed = true;
+        const tempName = opfs.name;
+        window.setTimeout(() => removeOpfsFile(tempName), 30 * 60 * 1000);
+      } else {
+        const blob = new Blob([result.buffer], { type: "video/mp4" });
+        downloadBlob(blob, filename);
+        outputSize = blob.size;
+        completed = true;
+      }
+
       const audioLabel = audio ? "含音轨" : "无音轨";
-      completeJobPanel(`已完成 · ${formatBytes(blob.size)}`, `${dims.width} × ${dims.height} · ${frames} 帧 · ${audioLabel} · 可拖动进度`);
-      showToast(`MP4 已生成 · ${dims.width} × ${dims.height} · ${formatBytes(blob.size)}${audio ? "" : " · 无音轨"}`);
+      const storageLabel = useStreaming ? "流式写入 · 无帧数上限" : "标准 MP4";
+      completeJobPanel(
+        `已完成 · ${formatBytes(outputSize)}`,
+        `${dims.width} × ${dims.height} · ${frames} 帧 · ${audioLabel} · ${storageLabel} · 可拖动进度`,
+      );
+      showToast(`MP4 已生成 · ${dims.width} × ${dims.height} · ${formatBytes(outputSize)}${audio ? "" : " · 无音轨"}`);
     } catch (error) {
+      if (opfs && !completed) {
+        try { await removeOpfsFile(opfs.name); } catch (_) {}
+      }
       if (state.jobAbort || (error && error.name === "AbortError")) {
         hideJobPanel();
         showToast("已取消后台转换");
@@ -3256,6 +3353,7 @@
     }
 
     requestAnimationFrame(tick);
+    cleanupOldOpfsOutputs();
 
     window.addEventListener("beforeunload", () => {
       if (state.objectUrl) URL.revokeObjectURL(state.objectUrl);
