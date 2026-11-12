@@ -255,6 +255,10 @@
     jobFileHandle: null,
     jobFileName: "",
     jobFileRoot: null,
+    jobEncoderLabel: "",
+    jobRenderLabel: "",
+    jobCaptureAbort: null,
+    wakeLock: null,
     previewWasPlaying: false,
   };
 
@@ -1302,6 +1306,12 @@
       renderRecordFrame();
     }
 
+    // A background conversion already renders every output frame. Rendering
+    // the preview at the same time doubles the character workload and is the
+    // main reason high-density jobs crawl or die. Keep the last preview frame
+    // on screen and let the job own the CPU/GPU.
+    if (state.jobRunning) return;
+
     if (!state.hasVideo) {
       if (now - state.lastIdleAt > 70) {
         state.lastIdleAt = now;
@@ -1650,9 +1660,11 @@
       const frames = seconds > 0 ? Math.max(1, Math.floor(seconds * fps + 0.0001)) : 0;
       const maxFrames = getMaxConvertFrames(quality);
       const unlimited = !Number.isFinite(maxFrames);
+      const gpu = canUseGpuRendering();
+      const renderLabel = gpu ? "GPU 渲染" : "CPU 渲染";
 
       summaryMain.textContent = `预计 ${frames} 帧 · ${formatTime(seconds)} · ${quality}p`;
-      summarySub.textContent = `${dimensions.width} × ${dimensions.height} · ${fps} fps · ${audio} · ${state.grid.cols} × ${state.grid.rows} 字符 · ${unlimited ? "流式写入磁盘 · 无帧数上限" : "标准 MP4"}`;
+      summarySub.textContent = `${dimensions.width} × ${dimensions.height} · ${fps} fps · ${audio} · ${state.grid.cols} × ${state.grid.rows} 字符 · ${renderLabel} · ${unlimited ? "流式写入磁盘 · 无帧数上限" : "标准 MP4"}`;
 
       if (seconds < 0.08) {
         summaryMain.textContent = "转换范围无效";
@@ -2207,13 +2219,82 @@
     );
   }
 
+  let gpuSupportCache = null;
+
+  function canUseGpuRendering() {
+    if (gpuSupportCache !== null) return gpuSupportCache;
+    try {
+      gpuSupportCache = Boolean(
+        window.AsciiGPURenderer &&
+        typeof window.AsciiGPURenderer === "function" &&
+        window.AsciiGPURenderer.isSupported(),
+      );
+    } catch (_) {
+      gpuSupportCache = false;
+    }
+    return gpuSupportCache;
+  }
+
+  function yieldToEventLoop() {
+    try {
+      if (window.scheduler && typeof window.scheduler.yield === "function") {
+        return window.scheduler.yield().catch(() => new Promise((resolve) => window.setTimeout(resolve, 0)));
+      }
+    } catch (_) {
+      /* Fall through to a timer task. */
+    }
+    return new Promise((resolve) => window.setTimeout(resolve, 0));
+  }
+
+  function estimateConversionBytes(quality, seconds) {
+    const bitrate = getConversionBitrate(quality);
+    return Math.ceil((bitrate / 8) * Math.max(0, seconds) * 1.18) + 12 * 1024 * 1024;
+  }
+
+  async function checkConversionStorage(quality, seconds) {
+    if (!navigator.storage || typeof navigator.storage.estimate !== "function") return;
+    const { usage = 0, quota = 0 } = await navigator.storage.estimate();
+    if (!quota) return;
+    const needed = estimateConversionBytes(quality, seconds);
+    if (usage + needed > quota * 0.98) {
+      throw new Error(
+        `磁盘空间不足：预计需要 ${formatBytes(needed)}，当前浏览器存储仅剩 ${formatBytes(Math.max(0, quota - usage))}`,
+      );
+    }
+  }
+
+  async function requestConversionWakeLock() {
+    if (!navigator.wakeLock || typeof navigator.wakeLock.request !== "function") return;
+    if (state.wakeLock) return;
+    try {
+      state.wakeLock = await navigator.wakeLock.request("screen");
+      state.wakeLock.addEventListener("release", () => { state.wakeLock = null; }, { once: true });
+    } catch (_) {
+      state.wakeLock = null;
+    }
+  }
+
+  function releaseConversionWakeLock() {
+    const lock = state.wakeLock;
+    state.wakeLock = null;
+    if (lock) {
+      try { lock.release(); } catch (_) {}
+    }
+  }
+
   async function cleanupOldOpfsOutputs() {
     if (!supportsStreamingConversion() || state.jobRunning) return;
     try {
       const root = await navigator.storage.getDirectory();
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
       for await (const [name, handle] of root.entries()) {
-        if (name.startsWith("hwz-ascii-") && name.endsWith(".mp4") && handle.kind === "file") {
-          try { await root.removeEntry(name); } catch (_) {}
+        if (!name.startsWith("hwz-ascii-") || !name.endsWith(".mp4") || handle.kind !== "file") continue;
+        try {
+          const file = await handle.getFile();
+          // Never delete a temp file that another tab may still be writing.
+          if (file.lastModified && file.lastModified < cutoff) await root.removeEntry(name);
+        } catch (_) {
+          /* Skip files that disappeared or cannot be inspected. */
         }
       }
     } catch (_) {
@@ -2346,6 +2427,7 @@
       try { readyReject(error); } catch (_) {}
       try { doneReject(error); } catch (_) {}
       for (const pending of ackMap.values()) {
+        if (pending.timer) window.clearTimeout(pending.timer);
         try { pending.reject(error); } catch (_) {}
       }
       ackMap.clear();
@@ -2359,6 +2441,7 @@
         const pending = ackMap.get(message.index);
         if (pending) {
           ackMap.delete(message.index);
+          if (pending.timer) window.clearTimeout(pending.timer);
           pending.resolve(message);
         }
       } else if (message.type === "done") {
@@ -2377,10 +2460,18 @@
       done,
       sendVideo(frame, index, keyFrame) {
         return new Promise((resolve, reject) => {
-          ackMap.set(index, { resolve, reject });
+          const timer = window.setTimeout(() => {
+            const pending = ackMap.get(index);
+            if (!pending) return;
+            ackMap.delete(index);
+            reject(new Error("编码器长时间无响应，已停止转换"));
+          }, 30000);
+          ackMap.set(index, { resolve, reject, timer });
           try {
             worker.postMessage({ type: "video", frame, index, keyFrame }, [frame]);
           } catch (error) {
+            const pending = ackMap.get(index);
+            if (pending?.timer) window.clearTimeout(pending.timer);
             ackMap.delete(index);
             try { frame.close(); } catch (_) {}
             reject(error);
@@ -2456,43 +2547,112 @@
     });
   }
 
-  async function seekConversionVideo(video, time) {
+  async function waitForPresentedFrame() {
+    // `seeked` already means the decoded frame is available to drawImage.
+    // Yield one task so the new frame can be committed without depending on
+    // requestAnimationFrame, which is heavily throttled in background tabs.
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+  }
+
+  async function seekConversionVideo(video, time, attempt = 0) {
     if (Math.abs(video.currentTime - time) < 0.003 && video.readyState >= 2) {
-      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      await waitForPresentedFrame();
       return;
     }
-    await new Promise((resolve, reject) => {
+    try {
+      await new Promise((resolve, reject) => {
+        let settled = false;
+        const cleanup = () => {
+          video.removeEventListener("seeked", onSeeked);
+          video.removeEventListener("error", onError);
+          window.clearTimeout(timer);
+        };
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve();
+        };
+        const fail = () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(new Error("视频定位失败"));
+        };
+        const onSeeked = () => finish();
+        const onError = () => fail();
+        const timer = window.setTimeout(fail, 20000);
+        video.addEventListener("seeked", onSeeked);
+        video.addEventListener("error", onError);
+        try {
+          const duration = Number.isFinite(video.duration) ? video.duration : time + 1;
+          video.currentTime = clamp(time, 0, Math.max(0, duration - 0.001));
+        } catch (_) {
+          fail();
+        }
+      });
+    } catch (error) {
+      if (attempt < 1 && !state.jobAbort) {
+        await sleep(250);
+        return seekConversionVideo(video, time, attempt + 1);
+      }
+      throw error;
+    }
+    await waitForPresentedFrame(video);
+  }
+
+  function capturePlaybackFrame(video, timeout = 15000) {
+    return new Promise((resolve, reject) => {
+      if (video.ended) {
+        resolve(null);
+        return;
+      }
       let settled = false;
+      let callbackId = 0;
+      let abort = null;
       const cleanup = () => {
-        video.removeEventListener("seeked", onSeeked);
-        video.removeEventListener("error", onError);
         window.clearTimeout(timer);
+        video.removeEventListener("ended", onEnded);
+        if (abort && state.jobCaptureAbort === abort) state.jobCaptureAbort = null;
+        try { video.cancelVideoFrameCallback(callbackId); } catch (_) {}
       };
-      const finish = () => {
+      const finish = (value) => {
         if (settled) return;
         settled = true;
         cleanup();
-        resolve();
+        video.pause();
+        resolve(value);
       };
-      const fail = () => {
+      const fail = (error) => {
         if (settled) return;
         settled = true;
         cleanup();
-        reject(new Error("视频定位失败"));
+        reject(error);
       };
-      const onSeeked = () => finish();
-      const onError = () => fail();
-      const timer = window.setTimeout(fail, 8000);
-      video.addEventListener("seeked", onSeeked);
-      video.addEventListener("error", onError);
+      abort = () => fail(new DOMException("Aborted", "AbortError"));
+      state.jobCaptureAbort = abort;
+      const onFrame = (now, metadata) => {
+        const mediaTime = metadata && Number.isFinite(metadata.mediaTime) ? metadata.mediaTime : video.currentTime;
+        finish({ ...(metadata || {}), mediaTime });
+      };
+      const onEnded = () => finish(null);
+      const timer = window.setTimeout(() => fail(new Error("视频解码等待超时")), timeout);
+      video.addEventListener("ended", onEnded, { once: true });
       try {
-        const duration = Number.isFinite(video.duration) ? video.duration : time + 1;
-        video.currentTime = clamp(time, 0, Math.max(0, duration - 0.001));
-      } catch (_) {
-        fail();
+        callbackId = video.requestVideoFrameCallback(onFrame);
+      } catch (error) {
+        fail(error);
+        return;
+      }
+      const started = (() => {
+        try { return video.play(); } catch (error) { fail(error); return null; }
+      })();
+      if (started && typeof started.catch === "function") {
+        started.catch((error) => {
+          if (!settled && error && error.name !== "AbortError") fail(error);
+        });
       }
     });
-    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
   }
 
   async function prepareConversionAudio(src, startAt, duration) {
@@ -2541,7 +2701,7 @@
       offset += count;
       chunks += 1;
       if (chunks % 20 === 0) {
-        await new Promise((resolve) => requestAnimationFrame(resolve));
+        await yieldToEventLoop();
       }
     }
   }
@@ -2566,6 +2726,7 @@
     }
     state.jobRunning = false;
     state.jobAbort = false;
+    state.jobCaptureAbort = null;
     state.jobSnapshot = null;
     state.jobFileHandle = null;
     state.jobFileRoot = null;
@@ -2575,6 +2736,12 @@
   function cancelConversionJob() {
     if (!state.jobRunning) return;
     state.jobAbort = true;
+    if (state.jobCaptureAbort) {
+      try { state.jobCaptureAbort(); } catch (_) {}
+    }
+    if (state.jobVideo) {
+      try { state.jobVideo.pause(); } catch (_) {}
+    }
     if (state.jobChannel) {
       try { state.jobChannel.terminate(); } catch (_) {}
     }
@@ -2637,8 +2804,11 @@
 
     state.jobRunning = true;
     state.jobAbort = false;
+    state.jobEncoderLabel = "";
+    state.jobRenderLabel = "";
     showJobPanel();
     const settings = { ...state.settings };
+    settings._fontCss = FONTS[settings.font]?.css || FONTS.mono.css;
     const ramp = getRamp().slice();
     const grid = { ...state.grid };
     const dims = getRecordDimensions(quality);
@@ -2660,8 +2830,11 @@
     let audio = null;
     let opfs = null;
     let completed = false;
+    let gpuRenderer = null;
+    let gpuActive = false;
 
     try {
+      await requestConversionWakeLock();
       updateJobPanel(1, "正在检查编码能力…", `${dims.width} × ${dims.height} · H.264`);
       const support = await VideoEncoder.isConfigSupported(codecConfig);
       if (!support.supported) {
@@ -2669,8 +2842,14 @@
       }
       if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
 
+      const estimatedBytes = estimateConversionBytes(quality, frames / fps);
       if (useStreaming) {
-        updateJobPanel(2, "正在创建磁盘文件…", "流式写入，帧数不设上限");
+        updateJobPanel(2, "正在检查磁盘空间…", `预计输出约 ${formatBytes(estimatedBytes)}`);
+        await checkConversionStorage(quality, frames / fps);
+      }
+
+      if (useStreaming) {
+        updateJobPanel(2, "正在创建磁盘文件…", `预计输出约 ${formatBytes(estimatedBytes)} · 流式写入`);
         opfs = await createOpfsOutput();
         state.jobFileHandle = opfs.handle;
         state.jobFileRoot = opfs.root;
@@ -2709,10 +2888,11 @@
         sampleRate: audio?.sampleRate || 48000,
         channels: audio?.channels || 2,
         fileHandle: opfs ? opfs.handle : null,
-        expectedVideoChunks: frames,
-        expectedAudioChunks: audio ? Math.ceil(audio.length / 512) + 64 : undefined,
+        expectedVideoChunks: frames + Math.max(24, Math.ceil(frames * 0.02)),
+        expectedAudioChunks: audio ? Math.ceil(audio.length / 512) + 512 : undefined,
       });
-      await channel.ready;
+      const ready = await channel.ready;
+      state.jobEncoderLabel = ready.hardwareAcceleration === "prefer-hardware" ? "硬件编码优先" : "软件编码";
       if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
 
       if (audio) {
@@ -2720,11 +2900,25 @@
         await sendConversionAudio(channel, audio);
       }
 
-      const outputCanvas = document.createElement("canvas");
+      let outputCanvas = document.createElement("canvas");
       outputCanvas.width = dims.width;
       outputCanvas.height = dims.height;
-      const outputCtx = outputCanvas.getContext("2d", { alpha: false });
-      outputCtx.imageSmoothingEnabled = true;
+      let outputCtx = null;
+      gpuActive = canUseGpuRendering();
+      if (gpuActive) {
+        try {
+          gpuRenderer = new window.AsciiGPURenderer(outputCanvas);
+        } catch (error) {
+          console.warn("GPU renderer unavailable, falling back to Canvas2D:", error);
+          gpuRenderer = null;
+          gpuActive = false;
+        }
+      }
+      if (!gpuActive) {
+        outputCtx = outputCanvas.getContext("2d", { alpha: false });
+        outputCtx.imageSmoothingEnabled = true;
+      }
+      state.jobRenderLabel = gpuActive ? "GPU 渲染" : "CPU 渲染";
 
       const sampleCanvas = document.createElement("canvas");
       sampleCanvas.width = grid.cols;
@@ -2733,31 +2927,116 @@
       sampleCtx.imageSmoothingEnabled = true;
 
       const frameDuration = Math.round(1e6 / fps);
-      for (let index = 0; index < frames; index += 1) {
-        if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
-        const time = start + index / fps;
+      let lastPanelAt = 0;
+      let emitted = 0;
+
+      const updateProgress = (index, time, force = false) => {
+        const now = performance.now();
+        if (!force && index !== 0 && index !== frames - 1 && now - lastPanelAt < 220) return;
+        lastPanelAt = now;
         const percent = 14 + ((index + 1) / frames) * 80;
         updateJobPanel(
           percent,
           `正在转换第 ${index + 1} / ${frames} 帧`,
-          `${formatTime(time)} / ${formatTime(end)} · 使用开始时的画面设置${useStreaming ? " · 写入磁盘" : ""}`,
+          `${formatTime(time)} / ${formatTime(end)} · ${gpuActive ? "GPU 渲染" : "CPU 渲染"}${useStreaming ? " · 写入磁盘" : ""}`,
         );
+      };
 
-        await seekConversionVideo(hiddenVideo, time);
-        if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
-
-        sampleCtx.drawImage(hiddenVideo, 0, 0, grid.cols, grid.rows);
-        const pixels = sampleCtx.getImageData(0, 0, grid.cols, grid.rows).data;
+      const renderPixels = (pixels) => {
+        if (gpuActive && gpuRenderer) {
+          try {
+            gpuRenderer.render(pixels, grid.cols, grid.rows, settings, ramp);
+            return;
+          } catch (error) {
+            console.warn("GPU render failed, switching to Canvas2D:", error);
+            gpuActive = false;
+            state.jobRenderLabel = "CPU 渲染";
+            try { gpuRenderer.dispose(); } catch (_) {}
+            gpuRenderer = null;
+            outputCanvas = document.createElement("canvas");
+            outputCanvas.width = dims.width;
+            outputCanvas.height = dims.height;
+            outputCtx = outputCanvas.getContext("2d", { alpha: false });
+            outputCtx.imageSmoothingEnabled = true;
+          }
+        }
         drawAsciiFrame(outputCtx, outputCanvas.width, outputCanvas.height, grid.cols, grid.rows, pixels, settings, ramp);
+      };
 
+      const emitFrame = async (index) => {
+        if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
+        const time = start + index / fps;
+        updateProgress(index, time);
         const frame = new VideoFrame(outputCanvas, {
           timestamp: Math.round((index * 1e6) / fps),
           duration: frameDuration,
         });
         await channel.sendVideo(frame, index, index % fps === 0);
-        if (index % 2 === 0) {
-          await new Promise((resolve) => requestAnimationFrame(resolve));
+        emitted = index + 1;
+        if (index % 6 === 5) await yieldToEventLoop();
+      };
+
+      // Preferred path: decode sequentially by playing the muted source and
+      // pausing on every presented frame. This avoids seeking back to a
+      // keyframe for every frame, which dominated long conversions.
+      if (typeof hiddenVideo.requestVideoFrameCallback === "function") {
+        let captureProblem = null;
+        try {
+          try {
+            await seekConversionVideo(hiddenVideo, start);
+          } catch (error) {
+            captureProblem = error;
+            throw error;
+          }
+          hiddenVideo.pause();
+          sampleCtx.drawImage(hiddenVideo, 0, 0, grid.cols, grid.rows);
+          renderPixels(sampleCtx.getImageData(0, 0, grid.cols, grid.rows).data);
+          await emitFrame(0);
+          while (emitted < frames) {
+            if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
+            let metadata;
+            try {
+              metadata = await capturePlaybackFrame(hiddenVideo);
+            } catch (error) {
+              captureProblem = error;
+              throw error;
+            }
+            if (!metadata) break;
+            if (metadata.mediaTime < start - 0.08) continue;
+            const target = Math.min(
+              frames - 1,
+              Math.max(0, Math.round((metadata.mediaTime - start) * fps)),
+            );
+            if (target < emitted) continue;
+
+            sampleCtx.drawImage(hiddenVideo, 0, 0, grid.cols, grid.rows);
+            const pixels = sampleCtx.getImageData(0, 0, grid.cols, grid.rows).data;
+            renderPixels(pixels);
+            while (emitted <= target && emitted < frames) {
+              await emitFrame(emitted);
+            }
+          }
+        } catch (error) {
+          if (state.jobAbort || (error && error.name === "AbortError")) throw error;
+          if (captureProblem !== error) throw error;
+          console.warn("Sequential playback capture failed; falling back to seeking:", error);
+          try { hiddenVideo.pause(); } catch (_) {}
         }
+      }
+
+      // Fallback for browsers/formats where frame callbacks do not fire, or
+      // if sequential playback failed partway through.
+      for (let index = emitted; index < frames; index += 1) {
+        if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
+        const time = start + index / fps;
+        updateProgress(index, time);
+        await seekConversionVideo(hiddenVideo, time);
+        if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
+
+        sampleCtx.drawImage(hiddenVideo, 0, 0, grid.cols, grid.rows);
+        const pixels = sampleCtx.getImageData(0, 0, grid.cols, grid.rows).data;
+        renderPixels(pixels);
+        await emitFrame(index);
       }
 
       if (state.jobAbort) throw new DOMException("Aborted", "AbortError");
@@ -2786,11 +3065,13 @@
 
       const audioLabel = audio ? "含音轨" : "无音轨";
       const storageLabel = useStreaming ? "流式写入 · 无帧数上限" : "标准 MP4";
+      const renderLabel = gpuActive ? "GPU 渲染" : "CPU 渲染";
+      const encoderLabel = state.jobEncoderLabel || "编码器";
       completeJobPanel(
         `已完成 · ${formatBytes(outputSize)}`,
-        `${dims.width} × ${dims.height} · ${frames} 帧 · ${audioLabel} · ${storageLabel} · 可拖动进度`,
+        `${dims.width} × ${dims.height} · ${frames} 帧 · ${audioLabel} · ${renderLabel} · ${encoderLabel} · ${storageLabel} · 可拖动进度`,
       );
-      showToast(`MP4 已生成 · ${dims.width} × ${dims.height} · ${formatBytes(outputSize)}${audio ? "" : " · 无音轨"}`);
+      showToast(`MP4 已生成 · ${dims.width} × ${dims.height} · ${formatBytes(outputSize)}${audio ? "" : " · 无音轨"} · ${renderLabel}`);
     } catch (error) {
       if (opfs && !completed) {
         try { await removeOpfsFile(opfs.name); } catch (_) {}
@@ -2800,10 +3081,20 @@
         showToast("已取消后台转换");
       } else {
         console.error("Background conversion failed:", error);
-        failJobPanel(error.message || "后台转换失败", `${dims.width} × ${dims.height} · 请尝试降低画质或缩短范围`);
+        const quota = error && (error.name === "QuotaExceededError" || /quota|space|空间|storage/i.test(error.message || ""));
+        const hint = quota
+          ? "浏览器存储空间不足：请释放磁盘空间，或降低输出画质"
+          : "请尝试降低画质、缩短范围，或查看控制台错误";
+        failJobPanel(error.message || "后台转换失败", `${dims.width} × ${dims.height} · ${hint}`);
         showToast(`转换失败：${error.message || "未知错误"}`, "error");
       }
     } finally {
+      if (gpuRenderer) {
+        try { gpuRenderer.dispose(); } catch (_) {}
+        gpuRenderer = null;
+      }
+      releaseConversionWakeLock();
+      state.needsRender = true;
       cleanupConversionJob();
     }
   }
@@ -3355,14 +3646,26 @@
     requestAnimationFrame(tick);
     cleanupOldOpfsOutputs();
 
-    window.addEventListener("beforeunload", () => {
+    window.addEventListener("beforeunload", (event) => {
       if (state.objectUrl) URL.revokeObjectURL(state.objectUrl);
       if (state.recording) {
         try { state.recordRecorder?.stop(); } catch (_) { /* Ignore. */ }
       }
-      try {
-        if (state.jobChannel) state.jobChannel.terminate();
-      } catch (_) { /* Ignore. */ }
+      if (state.jobRunning) {
+        // Closing the tab cannot finish a disk-streamed conversion. Ask first.
+        event.preventDefault();
+        event.returnValue = "";
+      } else {
+        try {
+          if (state.jobChannel) state.jobChannel.terminate();
+        } catch (_) { /* Ignore. */ }
+      }
+    });
+
+    document.addEventListener("visibilitychange", () => {
+      if (state.jobRunning && document.visibilityState === "visible") {
+        void requestConversionWakeLock();
+      }
     });
   }
 
@@ -3375,6 +3678,10 @@
       settings: { ...state.settings },
       recording: state.recording,
       exporting: state.exporting,
+      jobRunning: state.jobRunning,
+      jobRenderLabel: state.jobRenderLabel,
+      jobEncoderLabel: state.jobEncoderLabel,
+      gpuSupported: canUseGpuRendering(),
       audioReady: state.audioReady,
       video: {
         width: state.videoWidth,

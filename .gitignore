@@ -6,6 +6,9 @@ Desktop.ini
 # Logs
 *.log
 
+# Local test fixtures / captures
+.testdata/
+
 # Secrets
 .env
 .env.*

@@ -57,11 +57,34 @@ async function init(message) {
     height,
     bitrate,
     framerate: fps,
+    latencyMode: "quality",
     avc: { format: "avc" },
   };
-  const videoSupport = await VideoEncoder.isConfigSupported(videoConfig);
-  if (!videoSupport.supported) {
-    throw new Error(`当前浏览器不支持 ${width}×${height} 的 H.264 编码`);
+  const candidates = [
+    { ...videoConfig, hardwareAcceleration: "prefer-hardware" },
+    { ...videoConfig, hardwareAcceleration: "no-preference" },
+    { ...videoConfig, hardwareAcceleration: "prefer-software" },
+  ];
+  let chosenConfig = null;
+  let videoSupport = null;
+  let lastSupportError = null;
+  for (const config of candidates) {
+    try {
+      const support = await VideoEncoder.isConfigSupported(config);
+      if (support.supported) {
+        chosenConfig = { ...config, ...(support.config || {}) };
+        videoSupport = support;
+        break;
+      }
+    } catch (error) {
+      lastSupportError = error;
+    }
+  }
+  if (!chosenConfig) {
+    throw new Error(
+      `当前浏览器不支持 ${width}×${height} 的 H.264 编码` +
+      (lastSupportError ? `（${lastSupportError.message || lastSupportError}）` : ""),
+    );
   }
 
   if (streaming) {
@@ -97,7 +120,7 @@ async function init(message) {
     },
     error: (error) => fail("视频编码失败：" + (error.message || error)),
   });
-  videoEncoder.configure(videoConfig);
+  videoEncoder.configure(chosenConfig);
 
   if (hasAudio) {
     const audioConfig = {
@@ -124,7 +147,14 @@ async function init(message) {
     audioEncoder.configure(audioConfig);
   }
 
-  post("ready", { hasAudio, width, height, fps });
+  post("ready", {
+    hasAudio,
+    width,
+    height,
+    fps,
+    hardwareAcceleration: chosenConfig.hardwareAcceleration || "no-preference",
+    encoderConfig: videoSupport?.config || chosenConfig,
+  });
 }
 
 async function encodeVideo(message) {

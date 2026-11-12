@@ -112,7 +112,7 @@
               <output id="densityOut" for="density">100 列</output>
             </div>
             <input id="density" class="range" type="range" min="40" max="320" step="2" value="100">
-            <p class="hint">最高 320 列，细节更丰富；高密度会降低实时帧率</p>
+            <p class="hint">最高 320 列，细节更丰富；高密度会降低实时预览帧率，转换时优先启用 GPU 加速</p>
             <div class="resolution-row">
               <span class="resolution-copy">
                 <span>截图分辨率</span>
@@ -533,6 +533,7 @@
 
   <div class="toast-stack" id="toastStack" aria-live="polite"></div>
 
+  <script src="ascii-gpu.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
